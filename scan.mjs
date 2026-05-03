@@ -34,13 +34,23 @@ const FETCH_TIMEOUT_MS = 10_000;
 
 // ── API detection ───────────────────────────────────────────────────
 
+function normalizeUrl(input) {
+  if (!input) return '';
+  if (typeof input === 'string') return input;
+  if (input instanceof URL) return input.href;
+  if (typeof input === 'object') return input.href || input.url || '';
+  return '';
+}
+
 function detectApi(company) {
   // Greenhouse: explicit api field
-  if (company.api && company.api.includes('greenhouse')) {
+  if (company.api && typeof company.api === 'string' && company.api.includes('greenhouse')) {
     return { type: 'greenhouse', url: company.api };
   }
 
-  const url = company.careers_url || '';
+  const url = normalizeUrl(company.careers_url);
+
+  if (typeof url !== 'string') return null;
 
   // Ashby
   const ashbyMatch = url.match(/jobs\.ashbyhq\.com\/([^/?#]+)/);
@@ -80,7 +90,7 @@ function parseGreenhouse(json, companyName) {
     title: j.title || '',
     url: j.absolute_url || '',
     company: companyName,
-    location: j.location?.name || '',
+    location: j.location?.name || 'N/A',
   }));
 }
 
@@ -90,7 +100,7 @@ function parseAshby(json, companyName) {
     title: j.title || '',
     url: j.jobUrl || '',
     company: companyName,
-    location: j.location || '',
+    location: j.location || 'N/A',
   }));
 }
 
@@ -100,7 +110,7 @@ function parseLever(json, companyName) {
     title: j.text || '',
     url: j.hostedUrl || '',
     company: companyName,
-    location: j.categories?.location || '',
+    location: j.categories?.location || 'N/A',
   }));
 }
 
@@ -120,6 +130,20 @@ async function fetchJson(url) {
   }
 }
 
+async function fetchWebSearchJobs(url, companyName) {
+  const html = await fetch(url).then(r => r.text());
+
+  // naive extraction fallback (you can improve later)
+  const jobLinks = [...html.matchAll(/href="([^"]*jobs?[^"]*)"/gi)];
+
+  return jobLinks.map(m => ({
+    title: m[1],
+    url: new URL(m[1], url).href,
+    company: companyName,
+    location: 'N/A',
+  }));
+}
+
 // ── Title filter ────────────────────────────────────────────────────
 
 function buildTitleFilter(titleFilter) {
@@ -132,6 +156,57 @@ function buildTitleFilter(titleFilter) {
     const hasNegative = negative.some(k => lower.includes(k));
     return hasPositive && !hasNegative;
   };
+}
+
+function scoreJob(job, config) {
+  let score = 0;
+
+  const title = (job.title || '').toLowerCase();
+  const location = (job.location || '').toLowerCase();
+
+  const positive = (config.title_filter?.positive || []).map(k => k.toLowerCase());
+  const negative = (config.title_filter?.negative || []).map(k => k.toLowerCase());
+
+  // ── TITLE SCORING ───────────────────────────────
+
+  for (const kw of positive) {
+    if (title.includes(kw)) score += 10;
+  }
+
+  for (const kw of negative) {
+    if (title.includes(kw)) score -= 20;
+  }
+
+  // Bonus: strong signals
+  if (title.includes('senior')) score -= 3;
+  if (title.includes('junior')) score += 3;
+
+  // ── LOCATION SCORING ────────────────────────────
+
+  if (!location || location === 'n/a') {
+    score -= 2;
+  }
+
+  if (location.includes('remote')) score += 15;
+
+  // EU-friendly bias (customize this!)
+  if (
+    location.includes('germany') ||
+    location.includes('netherlands') ||
+    location.includes('poland') ||
+    location.includes('bulgaria') ||
+    location.includes('europe') ||
+    location.includes('emea')
+  ) {
+    score += 8;
+  }
+
+  // Penalize US-only roles (optional)
+  if (location.includes('usa') || location.includes('united states')) {
+    score -= 5;
+  }
+
+  return score;
 }
 
 // ── Dedup ───────────────────────────────────────────────────────────
@@ -198,7 +273,7 @@ function appendToPipeline(offers) {
     const procIdx = text.indexOf('## Procesadas');
     const insertAt = procIdx === -1 ? text.length : procIdx;
     const block = `\n${marker}\n\n` + offers.map(o =>
-      `- [ ] ${o.url} | ${o.company} | ${o.title}`
+      `- [ ] ${o.url} | ${o.company} | ${o.title} | ${o.location}`
     ).join('\n') + '\n\n';
     text = text.slice(0, insertAt) + block + text.slice(insertAt);
   } else {
@@ -208,7 +283,7 @@ function appendToPipeline(offers) {
     const insertAt = nextSection === -1 ? text.length : nextSection;
 
     const block = '\n' + offers.map(o =>
-      `- [ ] ${o.url} | ${o.company} | ${o.title}`
+      `- [ ] ${o.url} | ${o.company} | ${o.title} | ${o.location}`
     ).join('\n') + '\n';
     text = text.slice(0, insertAt) + block + text.slice(insertAt);
   }
@@ -219,11 +294,11 @@ function appendToPipeline(offers) {
 function appendToScanHistory(offers, date) {
   // Ensure file + header exist
   if (!existsSync(SCAN_HISTORY_PATH)) {
-    writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tstatus\n', 'utf-8');
+    writeFileSync(SCAN_HISTORY_PATH, 'url\tfirst_seen\tportal\ttitle\tcompany\tlocation\tstatus\n', 'utf-8');
   }
 
   const lines = offers.map(o =>
-    `${o.url}\t${date}\t${o.source}\t${o.title}\t${o.company}\tadded`
+    `${o.url}\t${date}\t${o.source}\t${o.title}\t${o.company}\t${o.location}\tadded`
   ).join('\n') + '\n';
 
   appendFileSync(SCAN_HISTORY_PATH, lines, 'utf-8');
@@ -269,7 +344,12 @@ async function main() {
   const targets = companies
     .filter(c => c.enabled !== false)
     .filter(c => !filterCompany || c.name.toLowerCase().includes(filterCompany))
-    .map(c => ({ ...c, _api: detectApi(c) }))
+    .map(c => ({
+      ...c,
+      _api: c.scan_method === 'websearch'
+        ? { type: 'websearch', url: c.careers_url }
+        : detectApi(c)
+    }))
     .filter(c => c._api !== null);
 
   const skippedCount = companies.filter(c => c.enabled !== false).length - targets.length;
@@ -291,9 +371,21 @@ async function main() {
 
   const tasks = targets.map(company => async () => {
     const { type, url } = company._api;
+
     try {
-      const json = await fetchJson(url);
-      const jobs = PARSERS[type](json, company.name);
+      let jobs = [];
+
+      // ── WEBSEARCH ROUTE ─────────────────────────────
+      if (type === 'websearch') {
+        jobs = await fetchWebSearchJobs(url, company.name);
+      }
+
+      // ── API ROUTE (existing logic) ──────────────────
+      else {
+        const json = await fetchJson(url);
+        jobs = PARSERS[type](json, company.name);
+      }
+
       totalFound += jobs.length;
 
       for (const job of jobs) {
@@ -301,20 +393,30 @@ async function main() {
           totalFiltered++;
           continue;
         }
+
         if (seenUrls.has(job.url)) {
           totalDupes++;
           continue;
         }
+
         const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`;
         if (seenCompanyRoles.has(key)) {
           totalDupes++;
           continue;
         }
-        // Mark as seen to avoid intra-scan dupes
+
         seenUrls.add(job.url);
         seenCompanyRoles.add(key);
-        newOffers.push({ ...job, source: `${type}-api` });
+
+        const scoredJob = {
+          ...job,
+          source: type === 'websearch' ? 'websearch' : `${type}-api`,
+          score: scoreJob(job, config),
+        };
+
+        newOffers.push(scoredJob);
       }
+
     } catch (err) {
       errors.push({ company: company.name, error: err.message });
     }
@@ -323,6 +425,7 @@ async function main() {
   await parallelFetch(tasks, CONCURRENCY);
 
   // 5. Write results
+  newOffers.sort((a, b) => b.score - a.score);
   if (!dryRun && newOffers.length > 0) {
     appendToPipeline(newOffers);
     appendToScanHistory(newOffers, date);
@@ -348,7 +451,7 @@ async function main() {
   if (newOffers.length > 0) {
     console.log('\nNew offers:');
     for (const o of newOffers) {
-      console.log(`  + ${o.company} | ${o.title} | ${o.location || 'N/A'}`);
+      console.log(`  +  ${o.company} | ${o.title} | ${o.location || 'N/A'} | Score: ${o.score}`);
     }
     if (dryRun) {
       console.log('\n(dry run — run without --dry-run to save results)');
@@ -359,6 +462,11 @@ async function main() {
 
   console.log(`\n→ Run /career-ops pipeline to evaluate new offers.`);
   console.log('→ Share results and get help: https://discord.gg/8pRpHETxa4');
+
+  if (process.argv.includes('--json')) {
+  console.log(JSON.stringify(newOffers, null, 2));
+  return;
+}
 }
 
 main().catch(err => {

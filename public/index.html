@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Job Scanner</title>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    button { padding: 10px 20px; font-size: 16px; }
+    pre { background: #111; color: #0f0; padding: 15px; }
+  </style>
+</head>
+<body>
+
+<h1>Job Scanner</h1>
+
+<button onclick="runScan()">Run Scan</button>
+
+<pre id="output"></pre>
+
+<script>
+async function runScan() {
+  const res = await fetch('/scan');
+  const data = await res.json();
+
+  const container = document.getElementById('output');
+
+  if (data.error) {
+    container.textContent = data.error;
+    return;
+  }
+
+  container.innerHTML = data.jobs.map(job => `
+    <div style="margin-bottom:10px">
+      <a href="${job.url}" target="_blank">${job.title}</a><br/>
+      <b>${job.company}</b> — ${job.location} (score: ${job.score ?? 'n/a'})
+    </div>
+  `).join('');
+}
+</script>
+
+</body>
+</html>
